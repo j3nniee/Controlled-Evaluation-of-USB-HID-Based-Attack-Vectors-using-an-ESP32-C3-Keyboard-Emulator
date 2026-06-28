@@ -1,0 +1,211 @@
+/* 
+  ESP32 BLE HID keyboard + OLED status (Hardened timings + fixes)
+  - Fixes: ensure modifiers released, slower typing, safer file creation
+  - Requirements: ESP32 BLE Keyboard (T-vK), Adafruit SSD1306, Adafruit GFX
+  - Behavior: advertise as BLE HID; on BLE connect + button press (3s countdown)
+    types 10 commands into an open terminal, creating ~/Desktop/the_keyboard_got_you.txt
+*/
+
+#include <BleKeyboard.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ------------------ CONFIG ------------------
+
+// Commands to type into the terminal on the Linux host (10 commands)
+// Use plain ASCII double-quotes and short paths to avoid layout/smart-quote issues.
+String commands[] = {
+  "echo Command 1 executed",
+  "pwd",
+  "ls -la",
+  "date",
+  "whoami",
+  "uptime",
+  "echo Security test in progress",
+  "mkdir -p ~/Desktop/test_folder",
+  "cd ~/Desktop",
+  "echo this is a security test > the_keyboard_got_you.txt"
+};
+
+const uint8_t COMMAND_COUNT = sizeof(commands)/sizeof(commands[0]);
+
+// Timing (conservative)
+const uint16_t DELAY_BETWEEN_COMMANDS_MS = 3500; // 3.5s between commands
+const uint16_t CHAR_DELAY_MS = 20;               // 20ms between characters (slow but reliable)
+const uint16_t AFTER_TERMINAL_OPEN_MS = 1200;    // wait after opening terminal
+const uint16_t AFTER_ENTER_MS = 600;            // wait after pressing Enter
+
+// Manual start button (recommended)
+const int BUTTON_PIN = 0;        // set to -1 to disable button
+bool requireButtonToStart = true;
+
+// OLED config
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// BLE keyboard
+BleKeyboard bleKeyboard("ESP32-HID", "ESP32-Lab", 100);
+
+// State
+bool startedTyping = false;
+uint8_t currentCommandIndex = 0;
+
+// ---------- helper functions ----------
+void showOLEDMessage(const char* line1, const char* line2 = nullptr) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("ESP32 HID Lab");
+  display.setCursor(0,14);
+  display.println(line1);
+  if (line2) {
+    display.setCursor(0,30);
+    display.println(line2);
+  }
+  display.display();
+}
+
+void showOLEDProgress() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("ESP32 HID Lab");
+  display.setCursor(0,14);
+  display.printf("BLE: %s", bleKeyboard.isConnected() ? "Connected":"Idle");
+  display.setCursor(0,28);
+  display.printf("Cmd %u/%u", currentCommandIndex, COMMAND_COUNT);
+  display.display();
+}
+
+// Make sure no modifier keys are stuck
+void releaseModifiersAndWait() {
+  bleKeyboard.releaseAll();
+  delay(50);
+}
+
+// Type a string char-by-char (uses bleKeyboard.print for each char)
+void safeType(const String &s) {
+  // ensure modifiers aren't active
+  releaseModifiersAndWait();
+  delay(40); // tiny extra settle
+  for (size_t i = 0; i < s.length(); ++i) {
+    // print one char at a time using plain ASCII
+    char c = s[i];
+    // guard: avoid sending '\r' or '\n' inside the command
+    if (c == '\r' || c == '\n') continue;
+    bleKeyboard.print((char)c);
+    delay(CHAR_DELAY_MS);
+  }
+}
+
+void typeCommandAndEnter(const String &cmd) {
+  // small pause before typing to ensure terminal is focused
+  delay(120);
+  safeType(cmd);
+  delay(40);
+  // ensure no modifiers accidentally remain
+  releaseModifiersAndWait();
+  // send Enter
+  bleKeyboard.write(KEY_RETURN);
+  // extra pause to let shell process the newline and run possible output
+  delay(AFTER_ENTER_MS);
+  showOLEDProgress();
+}
+
+// ------------------ setup & loop ------------------
+void setup() {
+  Serial.begin(115200);
+  delay(400);
+
+  if (BUTTON_PIN >= 0) pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // OLED init
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+  } else {
+    display.clearDisplay();
+    showOLEDMessage("Initializing...");
+  }
+
+  // Start BLE keyboard
+  bleKeyboard.begin();
+  showOLEDMessage("BLE ready", "Pair as keyboard");
+  delay(800);
+}
+
+void performTypingSequence() {
+  if (!bleKeyboard.isConnected()) return;
+
+  delay(AFTER_TERMINAL_OPEN_MS);
+
+  // Open terminal more robustly:
+  // 1) Release all modifiers first
+  releaseModifiersAndWait();
+
+  // 2) Try Ctrl+Alt+T (common Linux shortcut)
+  bleKeyboard.press(KEY_LEFT_CTRL);
+  bleKeyboard.press(KEY_LEFT_ALT);
+  bleKeyboard.write('t');
+  delay(60);
+  bleKeyboard.releaseAll();
+  delay(1200); // wait longer for terminal to open
+
+  // Send all commands, with conservative delays
+  for (uint8_t i = 0; i < COMMAND_COUNT; ++i) {
+    currentCommandIndex = i + 1;
+    String cmd = commands[i];
+    Serial.printf("Typing [%u/%u]: %s\n", i+1, COMMAND_COUNT, cmd.c_str());
+    typeCommandAndEnter(cmd);
+    // long delay to avoid concatenation on slower systems
+    delay(DELAY_BETWEEN_COMMANDS_MS);
+  }
+
+  showOLEDMessage("Typing done", "Check Desktop");
+}
+
+void loop() {
+  if (bleKeyboard.isConnected()) {
+    showOLEDProgress();
+
+    if (!startedTyping) {
+      if (!requireButtonToStart) {
+        // auto start if button disabled
+        performTypingSequence();
+        startedTyping = true;
+      } else {
+        if (BUTTON_PIN >= 0 && digitalRead(BUTTON_PIN) == LOW) { // pressed (active LOW)
+          delay(50); // debounce
+          if (digitalRead(BUTTON_PIN) == LOW) {
+            // 3-second safety countdown (shows on OLED)
+            showOLEDMessage("Starting in 3s...", "Cancel by disconnecting");
+            delay(1000);
+            showOLEDMessage("Starting in 2s...", "Cancel by disconnecting");
+            delay(1000);
+            showOLEDMessage("Starting in 1s...", "Cancel by disconnecting");
+            delay(1000);
+            // final release and short settle
+            releaseModifiersAndWait();
+            performTypingSequence();
+            startedTyping = true;
+          }
+        }
+      }
+    }
+  } else {
+    // reset if disconnected
+    if (startedTyping) {
+      startedTyping = false;
+      currentCommandIndex = 0;
+      showOLEDMessage("Disconnected");
+    } else {
+      showOLEDMessage("Waiting BLE...", "Pair as keyboard");
+    }
+  }
+
+  delay(80);
+}

